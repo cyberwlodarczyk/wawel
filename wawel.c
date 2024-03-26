@@ -3,9 +3,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <sodium.h>
 
-#define BUFFER_SIZE 1024
-#define KEY_SIZE 16
+#define TAG_SIZE crypto_aead_chacha20poly1305_ABYTES
+#define KEY_SIZE crypto_aead_chacha20poly1305_KEYBYTES
+#define NONCE_SIZE crypto_aead_chacha20poly1305_NPUBBYTES
 #define EXT_SIZE (sizeof(EXT) - 1)
 
 const char EXT[] = ".wawel";
@@ -69,8 +71,49 @@ bool decode_key(char *hex, uint8_t key[KEY_SIZE])
     return true;
 }
 
+int encrypt(uint8_t *ciphertext,
+            size_t *ciphertext_size,
+            uint8_t *plaintext,
+            size_t plaintext_size,
+            uint8_t *nonce,
+            uint8_t key[KEY_SIZE])
+{
+    return crypto_aead_chacha20poly1305_encrypt(ciphertext,
+                                                (unsigned long long *)ciphertext_size,
+                                                plaintext,
+                                                plaintext_size,
+                                                NULL,
+                                                0,
+                                                NULL,
+                                                nonce,
+                                                key);
+}
+
+int decrypt(uint8_t *plaintext,
+            size_t *plaintext_size,
+            uint8_t *ciphertext,
+            size_t ciphertext_size,
+            uint8_t *nonce,
+            uint8_t key[KEY_SIZE])
+{
+    return crypto_aead_chacha20poly1305_decrypt(plaintext,
+                                                (unsigned long long *)plaintext_size,
+                                                NULL,
+                                                ciphertext,
+                                                ciphertext_size,
+                                                NULL,
+                                                0,
+                                                nonce,
+                                                key);
+}
+
 int main(int argc, char **argv)
 {
+    if (sodium_init() == -1)
+    {
+        fprintf(stderr, "Error initalizing libsodium\n");
+        return EXIT_FAILURE;
+    }
     if (argc != 3)
     {
         fprintf(stderr, "Usage: %s <file> <key>\n", argv[0]);
@@ -82,60 +125,83 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error decoding the key\n");
         return EXIT_FAILURE;
     }
-    FILE *src, *dest;
-    char *filename = remove_ext(argv[1]);
-    bool decryption = true;
-    if (filename == NULL)
-    {
-        decryption = false;
-        filename = add_ext(argv[1]);
-    }
-    src = fopen(argv[1], "rb");
-    if (src == NULL)
+    FILE *file;
+    file = fopen(argv[1], "rb");
+    if (file == NULL)
     {
         perror("Error opening the source file");
         return EXIT_FAILURE;
     }
-    dest = fopen(filename, "wb");
-    if (dest == NULL)
+    if (fseek(file, 0, SEEK_END) != 0)
     {
-        perror("Error opening the destination file");
-        fclose(src);
+        fprintf(stderr, "Error determining the size of the source file\n");
+        fclose(file);
         return EXIT_FAILURE;
     }
-    uint8_t buffer[BUFFER_SIZE];
-    size_t n;
-    while ((n = fread(buffer, 1, BUFFER_SIZE, src)) > 0)
+    size_t n = ftell(file), m;
+    if (n == -1)
     {
-        for (size_t i = 0; i < n; i++)
-        {
-            if (decryption)
-            {
-                buffer[i] -= 1;
-            }
-            else
-            {
-                buffer[i] += 1;
-            }
-        }
-        fwrite(buffer, 1, n, dest);
+        fprintf(stderr, "Error determining the size of the source file\n");
+        fclose(file);
+        return EXIT_FAILURE;
     }
-    if (ferror(src))
+    if (fseek(file, 0, SEEK_SET) != 0)
+    {
+        fprintf(stderr, "Error determining the size of the source file\n");
+        fclose(file);
+        return EXIT_FAILURE;
+    }
+    uint8_t *input = malloc(n), *output;
+    if (fread(input, 1, n, file) != n || ferror(file))
     {
         perror("Error reading from the source file");
-        fclose(src);
-        fclose(dest);
+        fclose(file);
+        free(input);
         return EXIT_FAILURE;
     }
-    if (ferror(dest))
+    fclose(file);
+    char *filename = remove_ext(argv[1]);
+    if (filename == NULL)
+    {
+        filename = add_ext(argv[1]);
+        output = malloc(n + NONCE_SIZE + TAG_SIZE);
+        randombytes_buf(output, NONCE_SIZE);
+        encrypt(output + NONCE_SIZE, &m, input, n, output, key);
+        m += NONCE_SIZE;
+    }
+    else
+    {
+        output = malloc(n - NONCE_SIZE - TAG_SIZE);
+        if (decrypt(output, &m, input + NONCE_SIZE, n - NONCE_SIZE, input, key) != 0)
+        {
+            fprintf(stderr, "Error decrypting the destination file: Message forged\n");
+            free(filename);
+            free(input);
+            free(output);
+            return EXIT_FAILURE;
+        }
+    }
+    file = fopen(filename, "wb");
+    if (file == NULL)
+    {
+        perror("Error opening the destination file");
+        free(filename);
+        free(input);
+        free(output);
+        return EXIT_FAILURE;
+    }
+    if (fwrite(output, 1, m, file) != m || ferror(file))
     {
         perror("Error writing to the destination file");
-        fclose(src);
-        fclose(dest);
+        fclose(file);
+        free(filename);
+        free(input);
+        free(output);
         return EXIT_FAILURE;
     }
-    fclose(src);
-    fclose(dest);
+    fclose(file);
     free(filename);
+    free(input);
+    free(output);
     return EXIT_SUCCESS;
 }
