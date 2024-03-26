@@ -5,9 +5,11 @@
 #include <string.h>
 #include <sodium.h>
 
-#define TAG_SIZE crypto_aead_chacha20poly1305_ABYTES
+#define SALT_SIZE crypto_pwhash_scryptsalsa208sha256_SALTBYTES
 #define KEY_SIZE crypto_aead_chacha20poly1305_KEYBYTES
 #define NONCE_SIZE crypto_aead_chacha20poly1305_NPUBBYTES
+#define TAG_SIZE crypto_aead_chacha20poly1305_ABYTES
+#define ADDITIONAL_SIZE (SALT_SIZE + NONCE_SIZE + TAG_SIZE)
 #define EXT_SIZE (sizeof(EXT) - 1)
 
 const char EXT[] = ".wawel";
@@ -71,40 +73,56 @@ bool decode_key(char *hex, uint8_t key[KEY_SIZE])
     return true;
 }
 
-int encrypt(uint8_t *ciphertext,
-            size_t *ciphertext_size,
-            uint8_t *plaintext,
-            size_t plaintext_size,
-            uint8_t *nonce,
-            uint8_t key[KEY_SIZE])
+int derive_key(char *password, uint8_t salt[SALT_SIZE], uint8_t key[KEY_SIZE])
 {
-    return crypto_aead_chacha20poly1305_encrypt(ciphertext,
-                                                (unsigned long long *)ciphertext_size,
-                                                plaintext,
-                                                plaintext_size,
-                                                NULL,
-                                                0,
-                                                NULL,
-                                                nonce,
-                                                key);
+    return crypto_pwhash_scryptsalsa208sha256(
+        key,
+        KEY_SIZE,
+        password,
+        strlen(password),
+        salt,
+        crypto_pwhash_scryptsalsa208sha256_OPSLIMIT_INTERACTIVE,
+        crypto_pwhash_scryptsalsa208sha256_MEMLIMIT_INTERACTIVE);
 }
 
-int decrypt(uint8_t *plaintext,
-            size_t *plaintext_size,
-            uint8_t *ciphertext,
-            size_t ciphertext_size,
-            uint8_t *nonce,
-            uint8_t key[KEY_SIZE])
+int encrypt(
+    uint8_t *ciphertext,
+    size_t *ciphertext_size,
+    uint8_t *plaintext,
+    size_t plaintext_size,
+    uint8_t *nonce,
+    uint8_t key[KEY_SIZE])
 {
-    return crypto_aead_chacha20poly1305_decrypt(plaintext,
-                                                (unsigned long long *)plaintext_size,
-                                                NULL,
-                                                ciphertext,
-                                                ciphertext_size,
-                                                NULL,
-                                                0,
-                                                nonce,
-                                                key);
+    return crypto_aead_chacha20poly1305_encrypt(
+        ciphertext,
+        (unsigned long long *)ciphertext_size,
+        plaintext,
+        plaintext_size,
+        NULL,
+        0,
+        NULL,
+        nonce,
+        key);
+}
+
+int decrypt(
+    uint8_t *plaintext,
+    size_t *plaintext_size,
+    uint8_t *ciphertext,
+    size_t ciphertext_size,
+    uint8_t *nonce,
+    uint8_t key[KEY_SIZE])
+{
+    return crypto_aead_chacha20poly1305_decrypt(
+        plaintext,
+        (unsigned long long *)plaintext_size,
+        NULL,
+        ciphertext,
+        ciphertext_size,
+        NULL,
+        0,
+        nonce,
+        key);
 }
 
 int main(int argc, char **argv)
@@ -116,13 +134,7 @@ int main(int argc, char **argv)
     }
     if (argc != 3)
     {
-        fprintf(stderr, "Usage: %s <file> <key>\n", argv[0]);
-        return EXIT_FAILURE;
-    }
-    uint8_t key[KEY_SIZE];
-    if (!decode_key(argv[2], key))
-    {
-        fprintf(stderr, "Error decoding the key\n");
+        fprintf(stderr, "Usage: %s <file> <password>\n", argv[0]);
         return EXIT_FAILURE;
     }
     FILE *file;
@@ -161,20 +173,56 @@ int main(int argc, char **argv)
     }
     fclose(file);
     char *filename = remove_ext(argv[1]);
+    if (filename != NULL && n < ADDITIONAL_SIZE)
+    {
+        fprintf(stderr, "Error reading from the source file: Message is too short\n");
+        free(filename);
+        free(input);
+        return EXIT_FAILURE;
+    }
+    uint8_t salt[SALT_SIZE];
     if (filename == NULL)
     {
-        filename = add_ext(argv[1]);
-        output = malloc(n + NONCE_SIZE + TAG_SIZE);
-        randombytes_buf(output, NONCE_SIZE);
-        encrypt(output + NONCE_SIZE, &m, input, n, output, key);
-        m += NONCE_SIZE;
+        randombytes_buf(salt, SALT_SIZE);
     }
     else
     {
-        output = malloc(n - NONCE_SIZE - TAG_SIZE);
-        if (decrypt(output, &m, input + NONCE_SIZE, n - NONCE_SIZE, input, key) != 0)
+        memcpy(salt, input, SALT_SIZE);
+    }
+    uint8_t key[KEY_SIZE];
+    if (derive_key(argv[2], salt, key) != 0)
+    {
+        fprintf(stderr, "Error deriving the key from the password\n");
+        if (filename != NULL)
         {
-            fprintf(stderr, "Error decrypting the destination file: Message forged\n");
+            free(filename);
+        }
+        free(input);
+        return EXIT_FAILURE;
+    }
+    if (filename == NULL)
+    {
+        filename = add_ext(argv[1]);
+        output = malloc(n + ADDITIONAL_SIZE);
+        memcpy(output, salt, SALT_SIZE);
+        randombytes_buf(output + SALT_SIZE, NONCE_SIZE);
+        encrypt(output + SALT_SIZE + NONCE_SIZE, &m, input, n, output + SALT_SIZE, key);
+        m += SALT_SIZE + NONCE_SIZE;
+    }
+    else
+    {
+        output = malloc(n - ADDITIONAL_SIZE);
+        if (decrypt(
+                output,
+                &m,
+                input + SALT_SIZE + NONCE_SIZE,
+                n - SALT_SIZE - NONCE_SIZE,
+                input + SALT_SIZE,
+                key) != 0)
+        {
+            fprintf(
+                stderr,
+                "Error decrypting the destination file: Message has been forged or password is invalid\n");
             free(filename);
             free(input);
             free(output);
