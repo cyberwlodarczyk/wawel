@@ -164,14 +164,14 @@ bool edit_terminal_settings(void (*f)(struct termios *))
     return true;
 }
 
-void disable_echo(struct termios *term)
+void disable_echo_and_canonical_input(struct termios *term)
 {
-    term->c_lflag &= ~ECHO;
+    term->c_lflag &= ~(ECHO | ICANON);
 }
 
-void enable_echo(struct termios *term)
+void enable_echo_and_canonical_input(struct termios *term)
 {
-    term->c_lflag |= ECHO;
+    term->c_lflag |= ECHO | ICANON;
 }
 
 bool get_password(char **result)
@@ -179,8 +179,7 @@ bool get_password(char **result)
     char c, buffer[PASSWORD_BUFFER_SIZE];
     size_t n = 0;
     printf("Password: ");
-    fflush(stdout);
-    if (!edit_terminal_settings(disable_echo))
+    if (!edit_terminal_settings(disable_echo_and_canonical_input))
     {
         return false;
     }
@@ -190,7 +189,7 @@ bool get_password(char **result)
         if (c == '\n')
         {
             buffer[n++] = '\0';
-            printf("\n");
+            putchar('\n');
             break;
         }
         if (c == '\b' && n > 0)
@@ -200,13 +199,14 @@ bool get_password(char **result)
         else if (n < PASSWORD_BUFFER_SIZE)
         {
             buffer[n++] = c;
+            putchar('*');
         }
         else
         {
             return false;
         }
     }
-    if (!edit_terminal_settings(enable_echo))
+    if (!edit_terminal_settings(enable_echo_and_canonical_input))
     {
         return false;
     }
