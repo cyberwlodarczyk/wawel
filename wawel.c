@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sodium.h>
 
+#define eprintf(msg, ...) fprintf(stderr, (msg), ##__VA_ARGS__)
 #define SALT_SIZE crypto_pwhash_scryptsalsa208sha256_SALTBYTES
 #define KEY_SIZE crypto_aead_chacha20poly1305_KEYBYTES
 #define NONCE_SIZE crypto_aead_chacha20poly1305_NPUBBYTES
@@ -14,66 +15,29 @@
 
 const char EXT[] = ".wawel";
 
-char *add_ext(char *filename)
+bool is_ext(char *filename, size_t size)
 {
-    size_t n = strlen(filename);
-    char *result = malloc(n + EXT_SIZE + 1);
+    return size > EXT_SIZE && strcmp(filename + size - EXT_SIZE, EXT) == 0;
+}
+
+char *add_ext(char *filename, size_t size)
+{
+    char *result = malloc(size + EXT_SIZE + 1);
+    strncpy(result, filename, size);
+    strcpy(result + size, EXT);
+    return result;
+}
+
+char *remove_ext(char *filename, size_t size)
+{
+    size_t n = size - EXT_SIZE;
+    char *result = malloc(n + 1);
     strncpy(result, filename, n);
-    strcpy(result + n, EXT);
+    result[n] = '\0';
     return result;
 }
 
-char *remove_ext(char *filename)
-{
-    size_t n = strlen(filename), m = n - EXT_SIZE;
-    if (n < EXT_SIZE + 1 || strcmp(filename + m, EXT) != 0)
-    {
-        return NULL;
-    }
-    char *result = malloc(m + 1);
-    strncpy(result, filename, m);
-    result[m] = '\0';
-    return result;
-}
-
-bool decode_key(char *hex, uint8_t key[KEY_SIZE])
-{
-    if (strlen(hex) != KEY_SIZE * 2)
-    {
-        return false;
-    }
-    for (size_t i = 0; i < KEY_SIZE * 2; i++)
-    {
-        uint8_t x;
-        if (hex[i] >= '0' && hex[i] <= '9')
-        {
-            x = hex[i] - '0';
-        }
-        else if (hex[i] >= 'A' && hex[i] <= 'F')
-        {
-            x = hex[i] - 'A' + 10;
-        }
-        else if (hex[i] >= 'a' && hex[i] <= 'f')
-        {
-            x = hex[i] - 'a' + 10;
-        }
-        else
-        {
-            return false;
-        }
-        if (i % 2 == 0)
-        {
-            key[i / 2] = x << 4;
-        }
-        else
-        {
-            key[i / 2] |= x;
-        }
-    }
-    return true;
-}
-
-int derive_key(char *password, uint8_t salt[SALT_SIZE], uint8_t key[KEY_SIZE])
+int derive_key(char *password, uint8_t *salt, uint8_t key[KEY_SIZE])
 {
     return crypto_pwhash_scryptsalsa208sha256(
         key,
@@ -125,131 +89,144 @@ int decrypt(
         key);
 }
 
+bool get_file_size(FILE *file, size_t *size)
+{
+    if (fseek(file, 0, SEEK_END) != 0)
+    {
+        return false;
+    }
+    size_t n = ftell(file);
+    if (n == -1 || fseek(file, 0, SEEK_SET) != 0)
+    {
+        return false;
+    }
+    *size = n;
+    return true;
+}
+
+bool read_file(char *filename, uint8_t **content, size_t *size)
+{
+    FILE *file = fopen(filename, "rb");
+    if (file == NULL)
+    {
+        return false;
+    }
+    size_t n;
+    if (!get_file_size(file, &n))
+    {
+        fclose(file);
+        return false;
+    }
+    uint8_t *buffer = malloc(n);
+    if (fread(buffer, 1, n, file) != n || ferror(file))
+    {
+        fclose(file);
+        free(buffer);
+        return false;
+    }
+    fclose(file);
+    *content = buffer;
+    *size = n;
+    return true;
+}
+
+bool write_file(char *filename, uint8_t *content, size_t size)
+{
+    FILE *file = fopen(filename, "wb");
+    if (file == NULL)
+    {
+        return false;
+    }
+    if (fwrite(content, 1, size, file) != size || ferror(file))
+    {
+        fclose(file);
+        return false;
+    }
+    fclose(file);
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     if (sodium_init() == -1)
     {
-        fprintf(stderr, "Error initalizing libsodium\n");
+        eprintf("Error initalizing libsodium\n");
         return EXIT_FAILURE;
     }
     if (argc != 3)
     {
-        fprintf(stderr, "Usage: %s <file> <password>\n", argv[0]);
+        eprintf("Usage: %s <file> <password>\n", argv[0]);
         return EXIT_FAILURE;
     }
-    FILE *file;
-    file = fopen(argv[1], "rb");
-    if (file == NULL)
+    char *filename = argv[1], *password = argv[2];
+    uint8_t *input, *output;
+    size_t input_size, output_size, filename_size = strlen(filename);
+    if (!read_file(argv[1], &input, &input_size))
     {
         perror("Error opening the source file");
         return EXIT_FAILURE;
     }
-    if (fseek(file, 0, SEEK_END) != 0)
+    if (is_ext(filename, filename_size))
     {
-        fprintf(stderr, "Error determining the size of the source file\n");
-        fclose(file);
-        return EXIT_FAILURE;
-    }
-    size_t n = ftell(file), m;
-    if (n == -1)
-    {
-        fprintf(stderr, "Error determining the size of the source file\n");
-        fclose(file);
-        return EXIT_FAILURE;
-    }
-    if (fseek(file, 0, SEEK_SET) != 0)
-    {
-        fprintf(stderr, "Error determining the size of the source file\n");
-        fclose(file);
-        return EXIT_FAILURE;
-    }
-    uint8_t *input = malloc(n), *output;
-    if (fread(input, 1, n, file) != n || ferror(file))
-    {
-        perror("Error reading from the source file");
-        fclose(file);
-        free(input);
-        return EXIT_FAILURE;
-    }
-    fclose(file);
-    char *filename = remove_ext(argv[1]);
-    if (filename != NULL && n < ADDITIONAL_SIZE)
-    {
-        fprintf(stderr, "Error reading from the source file: Message is too short\n");
-        free(filename);
-        free(input);
-        return EXIT_FAILURE;
-    }
-    uint8_t salt[SALT_SIZE];
-    if (filename == NULL)
-    {
-        randombytes_buf(salt, SALT_SIZE);
-    }
-    else
-    {
-        memcpy(salt, input, SALT_SIZE);
-    }
-    uint8_t key[KEY_SIZE];
-    if (derive_key(argv[2], salt, key) != 0)
-    {
-        fprintf(stderr, "Error deriving the key from the password\n");
-        if (filename != NULL)
+        filename = remove_ext(filename, filename_size);
+        if (input_size < ADDITIONAL_SIZE)
         {
+            eprintf("The encrypted message is forged\n");
             free(filename);
+            free(input);
+            return EXIT_FAILURE;
         }
-        free(input);
-        return EXIT_FAILURE;
-    }
-    if (filename == NULL)
-    {
-        filename = add_ext(argv[1]);
-        output = malloc(n + ADDITIONAL_SIZE);
-        memcpy(output, salt, SALT_SIZE);
-        randombytes_buf(output + SALT_SIZE, NONCE_SIZE);
-        encrypt(output + SALT_SIZE + NONCE_SIZE, &m, input, n, output + SALT_SIZE, key);
-        m += SALT_SIZE + NONCE_SIZE;
-    }
-    else
-    {
-        output = malloc(n - ADDITIONAL_SIZE);
+        uint8_t key[KEY_SIZE];
+        if (derive_key(password, input, key) != 0)
+        {
+            eprintf("Error deriving a key from the password\n");
+            free(filename);
+            free(input);
+            return EXIT_FAILURE;
+        }
+        output = malloc(input_size - ADDITIONAL_SIZE);
         if (decrypt(
                 output,
-                &m,
+                &output_size,
                 input + SALT_SIZE + NONCE_SIZE,
-                n - SALT_SIZE - NONCE_SIZE,
+                input_size - SALT_SIZE - NONCE_SIZE,
                 input + SALT_SIZE,
                 key) != 0)
         {
-            fprintf(
-                stderr,
-                "Error decrypting the destination file: Message has been forged or password is invalid\n");
+            eprintf("The encrypted message is forged or the password is invalid\n");
             free(filename);
             free(input);
             free(output);
             return EXIT_FAILURE;
         }
     }
-    file = fopen(filename, "wb");
-    if (file == NULL)
+    else
     {
-        perror("Error opening the destination file");
-        free(filename);
-        free(input);
-        free(output);
-        return EXIT_FAILURE;
+        filename = add_ext(filename, filename_size);
+        output = malloc(input_size + ADDITIONAL_SIZE);
+        randombytes_buf(output, SALT_SIZE);
+        randombytes_buf(output + SALT_SIZE, NONCE_SIZE);
+        uint8_t key[KEY_SIZE];
+        if (derive_key(password, output, key) != 0)
+        {
+            eprintf("Error deriving a key from the password\n");
+            free(filename);
+            free(input);
+            free(output);
+            return EXIT_FAILURE;
+        }
+        encrypt(output + SALT_SIZE + NONCE_SIZE, &output_size, input, input_size, output + SALT_SIZE, key);
+        output_size += SALT_SIZE + NONCE_SIZE;
     }
-    if (fwrite(output, 1, m, file) != m || ferror(file))
+    free(input);
+    if (!write_file(filename, output, output_size))
     {
         perror("Error writing to the destination file");
-        fclose(file);
         free(filename);
-        free(input);
         free(output);
         return EXIT_FAILURE;
     }
-    fclose(file);
     free(filename);
-    free(input);
     free(output);
     return EXIT_SUCCESS;
 }
