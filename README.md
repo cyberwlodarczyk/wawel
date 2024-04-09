@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This is a file encryption tool that uses scrypt and ChaCha20-Poly1305 under the hood to provide both confidentiality and integrity.
+This is a file encryption and decryption tool that uses scrypt and ChaCha20-Poly1305 under the hood to provide both confidentiality and integrity. It has not been thoroughly tested or reviewed by a security professional and is intended for educational purposes only. The file size limit has been set to 512MB because the data is encrypted/decrypted in one go.
 
 ## Compilation
 
