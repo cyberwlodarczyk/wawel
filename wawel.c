@@ -6,18 +6,94 @@
 #include <termios.h>
 #include <unistd.h>
 #include <sodium.h>
+#include <errno.h>
 
 #define eprintf(msg, ...) fprintf(stderr, (msg), ##__VA_ARGS__)
 
-void *alloc(size_t size)
+void *mem_alloc(size_t n)
 {
-    void *buf = malloc(size);
+    void *buf = malloc(n);
     if (buf == NULL)
     {
         eprintf("Error allocating memory\n");
         return NULL;
     }
     return buf;
+}
+
+void *mem_alloc_lock(size_t n)
+{
+    void *buf = mem_alloc(n);
+    if (buf == NULL)
+    {
+        return NULL;
+    }
+    if (sodium_mlock(buf, n) == -1)
+    {
+        eprintf("Error locking memory\n");
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+void mem_free(uint8_t *buf)
+{
+    free(buf);
+}
+
+bool mem_unlock_free(uint8_t *buf, size_t n)
+{
+    if (sodium_munlock(buf, n) == -1)
+    {
+        eprintf("Error unlocking memory\n");
+        return false;
+    }
+    mem_free(buf);
+    return true;
+}
+
+FILE *file_open(char *filename, char *mode)
+{
+    FILE *file = fopen(filename, mode);
+    if (file == NULL)
+    {
+        eprintf("Error opening file \"%s\": %s\n", filename, strerror(errno));
+    }
+    return file;
+}
+
+size_t file_read(uint8_t *buf, size_t n, FILE *file)
+{
+    size_t k = fread(buf, 1, n, file);
+    if (ferror(file))
+    {
+        eprintf("Error reading from file: %s\n", strerror(errno));
+    }
+    return k;
+}
+
+bool file_read_all(uint8_t *buf, size_t n, FILE *file)
+{
+    if (file_read(buf, n, file) != n)
+    {
+        if (feof(file))
+        {
+            eprintf("Error reading from file: unexpected eof\n");
+        }
+        return false;
+    }
+    return true;
+}
+
+bool file_write_all(uint8_t *buf, size_t n, FILE *file)
+{
+    if (fwrite(buf, 1, n, file) != n)
+    {
+        eprintf("Error writing to file: %s\n", strerror(errno));
+        return false;
+    }
+    return true;
 }
 
 const char EXT_STR[] = ".wawel";
@@ -31,7 +107,7 @@ bool ext_check(char *filename, size_t size)
 
 char *ext_add(char *filename, size_t size)
 {
-    char *result = alloc(size + EXT_SIZE + 1);
+    char *result = mem_alloc(size + EXT_SIZE + 1);
     if (result == NULL)
     {
         return NULL;
@@ -44,7 +120,7 @@ char *ext_add(char *filename, size_t size)
 char *ext_remove(char *filename, size_t size)
 {
     size_t n = size - EXT_SIZE;
-    char *result = alloc(n + 1);
+    char *result = mem_alloc(n + 1);
     if (result == NULL)
     {
         return NULL;
@@ -70,7 +146,7 @@ bool aead_encrypt(FILE *src, FILE *dst, uint8_t *key)
     uint8_t header[aead_HEADER_SIZE];
     aead_state state;
     aead_init_push(&state, header, key);
-    if (fwrite(header, 1, aead_HEADER_SIZE, dst) != aead_HEADER_SIZE)
+    if (!file_write_all(header, aead_HEADER_SIZE, dst))
     {
         return false;
     }
@@ -78,7 +154,7 @@ bool aead_encrypt(FILE *src, FILE *dst, uint8_t *key)
     uint8_t output[aead_CHUNK_SIZE + aead_EXTRA_SIZE];
     while (true)
     {
-        size_t n = fread(input, 1, aead_CHUNK_SIZE, src);
+        size_t n = file_read(input, aead_CHUNK_SIZE, src);
         if (ferror(src))
         {
             return false;
@@ -93,7 +169,7 @@ bool aead_encrypt(FILE *src, FILE *dst, uint8_t *key)
             NULL,
             0,
             eof ? aead_TAG_FINAL : 0);
-        if (fwrite(output, 1, n + aead_EXTRA_SIZE, dst) != n + aead_EXTRA_SIZE)
+        if (!file_write_all(output, n + aead_EXTRA_SIZE, dst))
         {
             return false;
         }
@@ -107,13 +183,14 @@ bool aead_encrypt(FILE *src, FILE *dst, uint8_t *key)
 bool aead_decrypt(FILE *src, FILE *dst, uint8_t *key)
 {
     uint8_t header[aead_HEADER_SIZE];
-    if (fread(header, 1, aead_HEADER_SIZE, src) != aead_HEADER_SIZE)
+    if (!file_read_all(header, aead_HEADER_SIZE, src))
     {
         return false;
     }
     aead_state state;
     if (aead_init_pull(&state, header, key) != 0)
     {
+        eprintf("File is corrupted\n");
         return false;
     }
     uint8_t input[aead_CHUNK_SIZE + aead_EXTRA_SIZE];
@@ -121,7 +198,7 @@ bool aead_decrypt(FILE *src, FILE *dst, uint8_t *key)
     uint8_t tag;
     while (true)
     {
-        size_t n = fread(input, 1, aead_CHUNK_SIZE + aead_EXTRA_SIZE, src);
+        size_t n = file_read(input, aead_CHUNK_SIZE + aead_EXTRA_SIZE, src);
         if (ferror(src))
         {
             return false;
@@ -129,13 +206,15 @@ bool aead_decrypt(FILE *src, FILE *dst, uint8_t *key)
         int eof = feof(src);
         if (aead_pull(&state, output, NULL, &tag, input, n, NULL, 0) != 0)
         {
+            eprintf("Password is invalid or file is corrupted\n");
             return false;
         }
         if ((!eof && tag != 0) || (eof && tag != aead_TAG_FINAL))
         {
+            eprintf("File is corrupted\n");
             return false;
         }
-        if (fwrite(output, 1, n - aead_EXTRA_SIZE, dst) != n - aead_EXTRA_SIZE)
+        if (!file_write_all(output, n - aead_EXTRA_SIZE, dst))
         {
             return false;
         }
@@ -148,12 +227,16 @@ bool aead_decrypt(FILE *src, FILE *dst, uint8_t *key)
 
 #define kdf_SALT_SIZE crypto_pwhash_SALTBYTES
 
-bool kdf_derive(
+uint8_t *kdf_derive(
     uint8_t *password,
     size_t password_len,
-    uint8_t salt[kdf_SALT_SIZE],
-    uint8_t key[aead_KEY_SIZE])
+    uint8_t salt[kdf_SALT_SIZE])
 {
+    uint8_t *key = mem_alloc_lock(aead_KEY_SIZE);
+    if (key == NULL)
+    {
+        return NULL;
+    }
     if (crypto_pwhash(
             key,
             aead_KEY_SIZE,
@@ -164,9 +247,11 @@ bool kdf_derive(
             crypto_pwhash_MEMLIMIT_SENSITIVE,
             crypto_pwhash_ALG_ARGON2ID13) != 0)
     {
-        return false;
+        eprintf("Error deriving secret key\n");
+        mem_unlock_free(key, aead_KEY_SIZE);
+        return NULL;
     }
-    return true;
+    return key;
 }
 
 bool terminal_edit_settings(void (*f)(struct termios *))
@@ -200,7 +285,7 @@ void terminal_enable_echo(struct termios *term)
 
 size_t password_get(uint8_t *buf)
 {
-    uint8_t c;
+    int c;
     size_t n = 0;
     printf("Password: ");
     if (!terminal_edit_settings(terminal_disable_echo))
@@ -210,14 +295,20 @@ size_t password_get(uint8_t *buf)
     while (true)
     {
         c = getchar();
-        if (c == '\n')
+        if (ferror(stdin))
+        {
+            eprintf("Error reading from stdin: %s\n", strerror(errno));
+            return -1;
+        }
+        if (feof(stdin) || c == '\n')
         {
             putchar('\n');
             break;
         }
-        if (c == '\b' && n > 0)
+        if ((c == '\b' || c == 127) && n > 0)
         {
             n--;
+            printf("\b \b");
         }
         else if (n < PASSWORD_MAX_LENGTH)
         {
@@ -245,13 +336,17 @@ bool wawel_encrypt(
 {
     uint8_t salt[kdf_SALT_SIZE];
     randombytes_buf(salt, kdf_SALT_SIZE);
-    if (fwrite(salt, 1, kdf_SALT_SIZE, dst) != kdf_SALT_SIZE)
+    if (!file_write_all(salt, kdf_SALT_SIZE, dst))
     {
         return false;
     }
-    uint8_t key[aead_KEY_SIZE];
-    return kdf_derive(password, password_len, salt, key) &&
-           aead_encrypt(src, dst, key);
+    uint8_t *key = kdf_derive(password, password_len, salt);
+    if (key == NULL)
+    {
+        return false;
+    }
+    bool ok = aead_encrypt(src, dst, key);
+    return mem_unlock_free(key, aead_KEY_SIZE) && ok;
 }
 
 bool wawel_decrypt(
@@ -261,36 +356,47 @@ bool wawel_decrypt(
     size_t password_len)
 {
     uint8_t salt[kdf_SALT_SIZE];
-    if (fread(salt, 1, kdf_SALT_SIZE, src) != kdf_SALT_SIZE)
+    if (!file_read_all(salt, kdf_SALT_SIZE, src))
     {
         return false;
     }
-    uint8_t key[aead_KEY_SIZE];
-    return kdf_derive(password, password_len, salt, key) &&
-           aead_decrypt(src, dst, key);
+    uint8_t *key = kdf_derive(password, password_len, salt);
+    if (key == NULL)
+    {
+        return false;
+    }
+    bool ok = aead_decrypt(src, dst, key);
+    return mem_unlock_free(key, aead_KEY_SIZE) && ok;
 }
 
 bool wawel_run(int argc, char **argv)
 {
     if (sodium_init() == -1)
     {
+        eprintf("Error initalizing sodium\n");
         return false;
     }
     if (argc != 2)
     {
+        eprintf("Usage: %s <file>", argv[0]);
         return false;
     }
     char *src_filename = argv[1];
     size_t src_filename_len = strlen(src_filename);
-    FILE *src = fopen(src_filename, "rb");
+    FILE *src = file_open(src_filename, "rb");
     if (src == NULL)
     {
         return false;
     }
-    uint8_t *password = alloc(PASSWORD_MAX_LENGTH);
+    uint8_t *password = mem_alloc_lock(PASSWORD_MAX_LENGTH);
+    if (password == NULL)
+    {
+        return false;
+    }
     size_t password_len = password_get(password);
     if (password_len == -1)
     {
+        mem_unlock_free(password, PASSWORD_MAX_LENGTH);
         return false;
     }
     bool is_encrypted = ext_check(src_filename, src_filename_len);
@@ -298,16 +404,25 @@ bool wawel_run(int argc, char **argv)
     char *dst_filename = ext_fn(src_filename, src_filename_len);
     if (dst_filename == NULL)
     {
+        mem_unlock_free(password, PASSWORD_MAX_LENGTH);
         return false;
     }
-    FILE *dst = fopen(dst_filename, "wb");
+    FILE *dst = file_open(dst_filename, "wb");
     if (dst == NULL)
     {
+        mem_unlock_free(password, PASSWORD_MAX_LENGTH);
+        mem_free(dst_filename);
         return false;
     }
     bool (*fn)(FILE *, FILE *, uint8_t *, size_t) =
         is_encrypted ? wawel_decrypt : wawel_encrypt;
-    return fn(src, dst, password, password_len);
+    bool ok = fn(src, dst, password, password_len);
+    if (ok)
+    {
+        printf("Successfully created \"%s\"\n", dst_filename);
+    }
+    mem_free(dst_filename);
+    return mem_unlock_free(password, PASSWORD_MAX_LENGTH) && ok;
 }
 
 int main(int argc, char **argv)
