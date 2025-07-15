@@ -96,6 +96,16 @@ bool file_write_all(uint8_t *buf, size_t n, FILE *file)
     return true;
 }
 
+bool file_remove(char *filename)
+{
+    if (remove(filename) == -1)
+    {
+        eprintf("Error removing file \"%s\": %s\n", filename, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 const char EXT_STR[] = ".wawel";
 
 #define EXT_SIZE (sizeof(EXT_STR) - 1)
@@ -227,7 +237,7 @@ bool aead_decrypt(FILE *src, FILE *dst, uint8_t *key)
 
 #define kdf_SALT_SIZE crypto_pwhash_SALTBYTES
 
-uint8_t *kdf_derive(
+uint8_t *kdf_derive_key(
     uint8_t *password,
     size_t password_len,
     uint8_t salt[kdf_SALT_SIZE])
@@ -254,7 +264,15 @@ uint8_t *kdf_derive(
     return key;
 }
 
-bool terminal_edit_settings(void (*f)(struct termios *))
+void kdf_gen_salt(uint8_t salt[kdf_SALT_SIZE])
+{
+    randombytes_buf(salt, kdf_SALT_SIZE);
+}
+
+#define PASSWORD_MIN_LENGTH 12
+#define PASSWORD_MAX_LENGTH 64
+
+bool password_set_echo(bool is_echo)
 {
     struct termios term;
     if (tcgetattr(STDIN_FILENO, &term) == -1)
@@ -262,7 +280,14 @@ bool terminal_edit_settings(void (*f)(struct termios *))
         eprintf("Error getting terminal settings\n");
         return false;
     }
-    f(&term);
+    if (is_echo)
+    {
+        term.c_lflag |= ECHO | ICANON;
+    }
+    else
+    {
+        term.c_lflag &= ~(ECHO | ICANON);
+    }
     if (tcsetattr(STDIN_FILENO, TCSANOW, &term) == -1)
     {
         eprintf("Error setting terminal settings\n");
@@ -271,24 +296,12 @@ bool terminal_edit_settings(void (*f)(struct termios *))
     return true;
 }
 
-void terminal_disable_echo(struct termios *term)
-{
-    term->c_lflag &= ~(ECHO | ICANON);
-}
-
-void terminal_enable_echo(struct termios *term)
-{
-    term->c_lflag |= ECHO | ICANON;
-}
-
-#define PASSWORD_MAX_LENGTH 64
-
 size_t password_get(uint8_t *buf)
 {
     int c;
     size_t n = 0;
     printf("Password: ");
-    if (!terminal_edit_settings(terminal_disable_echo))
+    if (!password_set_echo(false))
     {
         return -1;
     }
@@ -298,12 +311,24 @@ size_t password_get(uint8_t *buf)
         if (ferror(stdin))
         {
             eprintf("Error reading from stdin: %s\n", strerror(errno));
+            password_set_echo(true);
             return -1;
         }
         if (feof(stdin) || c == '\n')
         {
-            putchar('\n');
-            break;
+            if (n < PASSWORD_MIN_LENGTH)
+            {
+                eprintf(
+                    "\nPassword must be at least %d characters long\n",
+                    PASSWORD_MIN_LENGTH);
+                password_set_echo(true);
+                return -1;
+            }
+            else
+            {
+                putchar('\n');
+                break;
+            }
         }
         if ((c == '\b' || c == 127) && n > 0)
         {
@@ -317,11 +342,14 @@ size_t password_get(uint8_t *buf)
         }
         else
         {
-            eprintf("\nPassword is too long\n");
+            eprintf(
+                "\nPassword must be at most %d characters long\n",
+                PASSWORD_MAX_LENGTH);
+            password_set_echo(true);
             return -1;
         }
     }
-    if (!terminal_edit_settings(terminal_enable_echo))
+    if (!password_set_echo(true))
     {
         return -1;
     }
@@ -335,12 +363,12 @@ bool wawel_encrypt(
     size_t password_len)
 {
     uint8_t salt[kdf_SALT_SIZE];
-    randombytes_buf(salt, kdf_SALT_SIZE);
+    kdf_gen_salt(salt);
     if (!file_write_all(salt, kdf_SALT_SIZE, dst))
     {
         return false;
     }
-    uint8_t *key = kdf_derive(password, password_len, salt);
+    uint8_t *key = kdf_derive_key(password, password_len, salt);
     if (key == NULL)
     {
         return false;
@@ -360,7 +388,7 @@ bool wawel_decrypt(
     {
         return false;
     }
-    uint8_t *key = kdf_derive(password, password_len, salt);
+    uint8_t *key = kdf_derive_key(password, password_len, salt);
     if (key == NULL)
     {
         return false;
@@ -378,7 +406,7 @@ bool wawel_run(int argc, char **argv)
     }
     if (argc != 2)
     {
-        eprintf("Usage: %s <file>", argv[0]);
+        eprintf("Usage: %s <file>\n", argv[0]);
         return false;
     }
     char *src_filename = argv[1];
@@ -420,6 +448,10 @@ bool wawel_run(int argc, char **argv)
     if (ok)
     {
         printf("Successfully created \"%s\"\n", dst_filename);
+    }
+    else
+    {
+        file_remove(dst_filename);
     }
     mem_free(dst_filename);
     return mem_unlock_free(password, PASSWORD_MAX_LENGTH) && ok;
